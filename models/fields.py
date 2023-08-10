@@ -255,9 +255,9 @@ class NeRF(nn.Module):
 
 
 class SingleVarianceNetwork(nn.Module):
-    def __init__(self, init_val):
+    def __init__(self, rank, init_val):
         super(SingleVarianceNetwork, self).__init__()
         self.register_parameter('variance', nn.Parameter(torch.tensor(init_val)))
-
+        self.rank = rank
     def forward(self, x):
-        return torch.ones([len(x), 1]) * torch.exp(self.variance * 10.0)
+        return torch.ones([len(x), 1]).to(self.rank) * torch.exp(self.variance * 10.0)

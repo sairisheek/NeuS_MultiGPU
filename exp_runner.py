@@ -8,11 +8,18 @@ import trimesh
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+
+
+
 from shutil import copyfile
 from icecream import ic
 from tqdm import tqdm
 from pyhocon import ConfigFactory
-from models.dataset import Dataset
+from models.dataset import NeuSDataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
 
@@ -32,16 +39,18 @@ class Runner:
         self.conf['dataset.data_dir'] = self.conf['dataset.data_dir'].replace('CASE_NAME', case)
         self.base_exp_dir = self.conf['general.base_exp_dir']
         os.makedirs(self.base_exp_dir, exist_ok=True)
-        self.dataset = Dataset(self.conf['dataset'])
+
+        self.batch_size = self.conf.get_int('train.batch_size')
+        self.end_iter = self.conf.get_int('train.end_iter')
+        self.world_size = 3 # CHANGE THIS TO # OF GPUS ON MACHINE
+        
         self.iter_step = 0
 
         # Training parameters
-        self.end_iter = self.conf.get_int('train.end_iter')
         self.save_freq = self.conf.get_int('train.save_freq')
         self.report_freq = self.conf.get_int('train.report_freq')
         self.val_freq = self.conf.get_int('train.val_freq')
         self.val_mesh_freq = self.conf.get_int('train.val_mesh_freq')
-        self.batch_size = self.conf.get_int('train.batch_size')
         self.validate_resolution_level = self.conf.get_int('train.validate_resolution_level')
         self.learning_rate = self.conf.get_float('train.learning_rate')
         self.learning_rate_alpha = self.conf.get_float('train.learning_rate_alpha')
@@ -57,25 +66,7 @@ class Runner:
         self.model_list = []
         self.writer = None
 
-        # Networks
-        params_to_train = []
-        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(self.device)
-        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(self.device)
-        self.deviation_network = SingleVarianceNetwork(**self.conf['model.variance_network']).to(self.device)
-        self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(self.device)
-        params_to_train += list(self.nerf_outside.parameters())
-        params_to_train += list(self.sdf_network.parameters())
-        params_to_train += list(self.deviation_network.parameters())
-        params_to_train += list(self.color_network.parameters())
-
-        self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
-
-        self.renderer = NeuSRenderer(self.nerf_outside,
-                                     self.sdf_network,
-                                     self.deviation_network,
-                                     self.color_network,
-                                     **self.conf['model.neus_renderer'])
-
+        
         # Load checkpoint
         latest_model_name = None
         if is_continue:
@@ -95,15 +86,62 @@ class Runner:
         if self.mode[:5] == 'train':
             self.file_backup()
 
-    def train(self):
+    def setup(self, rank, world_size):
+        os.environ['MASTER_ADDR'] = '127.0.0.1'
+        os.environ['MASTER_PORT'] = '12456'
+        dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    
+    def prepare(self, rank, batch_size=1, pin_memory=False, num_workers=0):
+        dataset = NeuSDataset(self.conf['dataset'], self.batch_size, self.end_iter) # batching over rays
+        sampler = DistributedSampler(dataset, num_replicas=self.world_size, rank=rank, shuffle=True)
+        dataloader = DataLoader(dataset, batch_size=batch_size, pin_memory=pin_memory, num_workers=num_workers, shuffle=False, sampler=sampler)
+        self.dataset = dataset
+        
+        return dataloader
+
+
+    def train(self, rank):
+        
+        # Networks
+        self.setup(rank, self.world_size)
+        params_to_train = []
+        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(rank)
+        self.nerf_outside = DDP(self.nerf_outside, device_ids=[rank], output_device=rank)
+        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(rank)
+        self.sdf_network = DDP(self.sdf_network, device_ids=[rank], output_device=rank)
+        self.deviation_network = SingleVarianceNetwork(rank, **self.conf['model.variance_network']).to(rank)
+        self.deviation_network = DDP(self.deviation_network, device_ids=[rank], output_device=rank)
+        self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(rank)
+        self.color_network = DDP(self.color_network, device_ids=[rank], output_device=rank)
+
+        params_to_train += list(self.nerf_outside.parameters())
+        params_to_train += list(self.sdf_network.parameters())
+        params_to_train += list(self.deviation_network.parameters())
+        params_to_train += list(self.color_network.parameters())
+
+        self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
+
+        self.renderer = NeuSRenderer(rank, self.nerf_outside,
+                                     self.sdf_network,
+                                     self.deviation_network,
+                                     self.color_network,
+                                     **self.conf['model.neus_renderer'])
+
+
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
         self.update_learning_rate()
-        res_step = self.end_iter - self.iter_step
-        image_perm = self.get_image_perm()
+        #res_step = self.end_iter - self.iter_step
+        #image_perm = self.get_image_perm()
 
-        for iter_i in tqdm(range(res_step)):
-            data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+        #for iter_i in tqdm(range(res_step)):
+        train_dataloader = self.prepare(rank, batch_size=1, pin_memory=False, num_workers=0)
 
+        for iter_i, data in enumerate(tqdm(train_dataloader)):
+            #data = self.dataset.gen_random_rays_at(image_perm[self.iter_step % len(image_perm)], self.batch_size)
+
+            #rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
+            #near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
+            data = data.squeeze().to(rank)
             rays_o, rays_d, true_rgb, mask = data[:, :3], data[:, 3: 6], data[:, 6: 9], data[:, 9: 10]
             near, far = self.dataset.near_far_from_sphere(rays_o, rays_d)
 
@@ -159,19 +197,21 @@ class Runner:
                 print(self.base_exp_dir)
                 print('iter:{:8>d} loss = {} lr={}'.format(self.iter_step, loss, self.optimizer.param_groups[0]['lr']))
 
-            if self.iter_step % self.save_freq == 0:
+            if self.iter_step % self.save_freq == 0 and rank == 0:
                 self.save_checkpoint()
 
             if self.iter_step % self.val_freq == 0:
-                self.validate_image()
+                self.validate_image(rank)
 
             if self.iter_step % self.val_mesh_freq == 0:
-                self.validate_mesh()
+                self.validate_mesh(rank)
 
             self.update_learning_rate()
 
-            if self.iter_step % len(image_perm) == 0:
-                image_perm = self.get_image_perm()
+            #if self.iter_step % len(image_perm) == 0:
+            #    image_perm = self.get_image_perm()
+
+        dist.destroy_process_group()
 
     def get_image_perm(self):
         return torch.randperm(self.dataset.n_images)
@@ -191,7 +231,7 @@ class Runner:
             learning_factor = (np.cos(np.pi * progress) + 1.0) * 0.5 * (1 - alpha) + alpha
 
         for g in self.optimizer.param_groups:
-            g['lr'] = self.learning_rate * learning_factor
+            g['lr'] = self.learning_rate * learning_factor * np.sqrt(self.world_size)
 
     def file_backup(self):
         dir_lis = self.conf['general.recording']
@@ -230,7 +270,7 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
 
-    def validate_image(self, idx=-1, resolution_level=-1):
+    def validate_image(self, rank, idx=-1, resolution_level=-1):
         if idx < 0:
             idx = np.random.randint(self.dataset.n_images)
 
@@ -239,6 +279,7 @@ class Runner:
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
         rays_o, rays_d = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
+        rays_o, rays_d = rays_o.to(rank), rays_d.to(rank)
         H, W, _ = rays_o.shape
         rays_o = rays_o.reshape(-1, 3).split(self.batch_size)
         rays_d = rays_d.reshape(-1, 3).split(self.batch_size)
@@ -288,13 +329,13 @@ class Runner:
             if len(out_rgb_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'validations_fine',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                                        '{:0>8d}_{}_{}_rank{}.png'.format(self.iter_step, i, idx, rank)),
                            np.concatenate([img_fine[..., i],
                                            self.dataset.image_at(idx, resolution_level=resolution_level)]))
             if len(out_normal_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'normals',
-                                        '{:0>8d}_{}_{}.png'.format(self.iter_step, i, idx)),
+                                        '{:0>8d}_{}_{}_rank{}.png'.format(self.iter_step, i, idx, rank)),
                            normal_img[..., i])
 
     def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
@@ -325,9 +366,9 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, world_space=False, resolution=64, threshold=0.0):
-        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32)
-        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32)
+    def validate_mesh(self, rank, world_space=False, resolution=512, threshold=0.0):
+        bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32).to(rank)
+        bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32).to(rank)
 
         vertices, triangles =\
             self.renderer.extract_geometry(bound_min, bound_max, resolution=resolution, threshold=threshold)
@@ -337,7 +378,7 @@ class Runner:
             vertices = vertices * self.dataset.scale_mats_np[0][0, 0] + self.dataset.scale_mats_np[0][:3, 3][None]
 
         mesh = trimesh.Trimesh(vertices, triangles)
-        mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}.ply'.format(self.iter_step)))
+        mesh.export(os.path.join(self.base_exp_dir, 'meshes', '{:0>8d}_rank{}.ply'.format(self.iter_step, rank)))
 
         logging.info('End')
 
@@ -369,8 +410,10 @@ class Runner:
 
 if __name__ == '__main__':
     print('Hello Wooden')
-
-    torch.set_default_tensor_type('torch.cuda.FloatTensor')
+    # suppose we have 3 gpus
+    world_size = 3    
+    
+    #torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
     FORMAT = "[%(filename)s:%(lineno)s - %(funcName)20s() ] %(message)s"
     logging.basicConfig(level=logging.DEBUG, format=FORMAT)
@@ -385,11 +428,14 @@ if __name__ == '__main__':
 
     args = parser.parse_args()
 
-    torch.cuda.set_device(args.gpu)
+    #torch.cuda.set_device(args.gpu)
     runner = Runner(args.conf, args.mode, args.case, args.is_continue)
 
     if args.mode == 'train':
-        runner.train()
+        torch.multiprocessing.spawn(
+        runner.train,
+        nprocs=world_size
+    )
     elif args.mode == 'validate_mesh':
         runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices

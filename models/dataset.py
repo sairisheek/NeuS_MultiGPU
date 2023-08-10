@@ -6,7 +6,7 @@ import os
 from glob import glob
 from icecream import ic
 from scipy.spatial.transform import Rotation as Rot
-from scipy.spatial.transform import Slerp
+from torch.utils.data import Dataset
 
 
 # This function is borrowed from IDR: https://github.com/lioryariv/idr
@@ -34,13 +34,14 @@ def load_K_Rt_from_P(filename, P=None):
     return intrinsics, pose
 
 
-class Dataset:
-    def __init__(self, conf):
-        super(Dataset, self).__init__()
+class NeuSDataset(Dataset):
+    def __init__(self, conf, batch_size, end_iter):
+        #super(Dataset, self).__init__()
         print('Load data: Begin')
-        self.device = torch.device('cuda')
+        #self.device = torch.device('cuda')
         self.conf = conf
-
+        self.end_iter = end_iter
+        self.batch_size = batch_size
         self.data_dir = conf.get_string('data_dir')
         self.render_cameras_name = conf.get_string('render_cameras_name')
         self.object_cameras_name = conf.get_string('object_cameras_name')
@@ -76,10 +77,10 @@ class Dataset:
 
         self.images = torch.from_numpy(self.images_np.astype(np.float32)).cpu()  # [n_images, H, W, 3]
         self.masks  = torch.from_numpy(self.masks_np.astype(np.float32)).cpu()   # [n_images, H, W, 3]
-        self.intrinsics_all = torch.stack(self.intrinsics_all).to(self.device)   # [n_images, 4, 4]
+        self.intrinsics_all = torch.stack(self.intrinsics_all)#.to(self.device)   # [n_images, 4, 4]
         self.intrinsics_all_inv = torch.inverse(self.intrinsics_all)  # [n_images, 4, 4]
         self.focal = self.intrinsics_all[0][0, 0]
-        self.pose_all = torch.stack(self.pose_all).to(self.device)  # [n_images, 4, 4]
+        self.pose_all = torch.stack(self.pose_all)#.to(self.device)  # [n_images, 4, 4]
         self.H, self.W = self.images.shape[1], self.images.shape[2]
         self.image_pixels = self.H * self.W
 
@@ -93,6 +94,15 @@ class Dataset:
         self.object_bbox_max = object_bbox_max[:3, 0]
 
         print('Load data: End')
+    
+    def __getitem__(self, idx):
+        data = self.gen_random_rays_at(idx%self.n_images, self.batch_size)
+        return data
+    
+    def __len__(self):
+        return self.end_iter
+
+
 
     def gen_rays_at(self, img_idx, resolution_level=1):
         """
@@ -122,7 +132,7 @@ class Dataset:
         rays_v = p / torch.linalg.norm(p, ord=2, dim=-1, keepdim=True)    # batch_size, 3
         rays_v = torch.matmul(self.pose_all[img_idx, None, :3, :3], rays_v[:, :, None]).squeeze()  # batch_size, 3
         rays_o = self.pose_all[img_idx, None, :3, 3].expand(rays_v.shape) # batch_size, 3
-        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1).cuda()    # batch_size, 10
+        return torch.cat([rays_o.cpu(), rays_v.cpu(), color, mask[:, :1]], dim=-1)#.cuda()    # batch_size, 10
 
     def gen_rays_between(self, idx_0, idx_1, ratio, resolution_level=1):
         """
