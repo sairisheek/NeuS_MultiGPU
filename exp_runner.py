@@ -1,10 +1,14 @@
 import os
+import re
 import time
 import logging
 import argparse
 import numpy as np
 import cv2 as cv
 import trimesh
+
+from collections import OrderedDict
+
 import torch
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
@@ -23,6 +27,15 @@ from models.dataset import NeuSDataset
 from models.fields import RenderingNetwork, SDFNetwork, SingleVarianceNetwork, NeRF
 from models.renderer import NeuSRenderer
 
+def convert_ddp_checkpoint(state_dict):
+    model_dict = OrderedDict()
+    pattern = re.compile('module.')
+    for k,v in state_dict.items():
+        if re.search("module", k):
+            model_dict[re.sub(pattern, '', k)] = v
+        else:
+            model_dict = state_dict
+    return model_dict
 
 class Runner:
     def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
@@ -77,10 +90,11 @@ class Runner:
                     model_list.append(model_name)
             model_list.sort()
             latest_model_name = model_list[-1]
+        self.latest_model_name = latest_model_name
 
-        if latest_model_name is not None:
-            logging.info('Find checkpoint: {}'.format(latest_model_name))
-            self.load_checkpoint(latest_model_name)
+        #if latest_model_name is not None:
+        #    logging.info('Find checkpoint: {}'.format(latest_model_name))
+        #    self.load_checkpoint(latest_model_name)
 
         # Backup codes and configs for debug
         if self.mode[:5] == 'train':
@@ -246,13 +260,13 @@ class Runner:
 
         copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
-    def load_checkpoint(self, checkpoint_name):
-        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=self.device)
-        self.nerf_outside.load_state_dict(checkpoint['nerf'])
-        self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
-        self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
-        self.color_network.load_state_dict(checkpoint['color_network_fine'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
+    def load_checkpoint(self, checkpoint_name, rank):
+        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=rank)
+        self.nerf_outside.load_state_dict(convert_ddp_checkpoint(['nerf']))
+        self.sdf_network.load_state_dict(convert_ddp_checkpoint(checkpoint['sdf_network_fine']))
+        self.deviation_network.load_state_dict(convert_ddp_checkpoint(checkpoint['variance_network_fine']))
+        self.color_network.load_state_dict(convert_ddp_checkpoint(checkpoint['color_network_fine']))
+        self.optimizer.load_state_dict(convert_ddp_checkpoint(checkpoint['optimizer']))
         self.iter_step = checkpoint['iter_step']
 
         logging.info('End')
@@ -367,6 +381,10 @@ class Runner:
         return img_fine
 
     def validate_mesh(self, rank, world_space=False, resolution=512, threshold=0.0):
+        if self.is_continue and self.latest_model_name is not None:
+            logging.info('Find checkpoint: {}'.format(self.latest_model_name))
+            self.load_checkpoint(self.latest_model_name)
+
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32).to(rank)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32).to(rank)
 
@@ -437,7 +455,11 @@ if __name__ == '__main__':
         nprocs=world_size
     )
     elif args.mode == 'validate_mesh':
-        runner.validate_mesh(world_space=True, resolution=512, threshold=args.mcube_threshold)
+        torch.multiprocessing.spawn(
+        runner.validate_mesh,
+        nprocs=1
+    )
+        runner.validate_mesh(world_space=True, resolution=1024, threshold=args.mcube_threshold)
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
         _, img_idx_0, img_idx_1 = args.mode.split('_')
         img_idx_0 = int(img_idx_0)
