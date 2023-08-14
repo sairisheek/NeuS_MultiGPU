@@ -38,7 +38,7 @@ def convert_ddp_checkpoint(state_dict):
     return model_dict
 
 class Runner:
-    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False):
+    def __init__(self, conf_path, mode='train', case='CASE_NAME', is_continue=False, world_size=3):
         self.device = torch.device('cuda')
 
         # Configuration
@@ -55,7 +55,7 @@ class Runner:
 
         self.batch_size = self.conf.get_int('train.batch_size')
         self.end_iter = self.conf.get_int('train.end_iter')
-        self.world_size = 3 # CHANGE THIS TO # OF GPUS ON MACHINE
+        self.world_size = world_size # CHANGE THIS TO # OF GPUS ON MACHINE
         
         self.iter_step = 0
 
@@ -91,7 +91,7 @@ class Runner:
             model_list.sort()
             latest_model_name = model_list[-1]
         self.latest_model_name = latest_model_name
-
+        self.ckpt_loaded = False
         #if latest_model_name is not None:
         #    logging.info('Find checkpoint: {}'.format(latest_model_name))
         #    self.load_checkpoint(latest_model_name)
@@ -104,6 +104,21 @@ class Runner:
         os.environ['MASTER_ADDR'] = '127.0.0.1'
         os.environ['MASTER_PORT'] = '12456'
         dist.init_process_group("nccl", rank=rank, world_size=world_size)
+        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(rank)
+        self.nerf_outside = DDP(self.nerf_outside, device_ids=[rank], output_device=rank)
+        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(rank)
+        self.sdf_network = DDP(self.sdf_network, device_ids=[rank], output_device=rank)
+        self.deviation_network = SingleVarianceNetwork(rank, **self.conf['model.variance_network']).to(rank)
+        self.deviation_network = DDP(self.deviation_network, device_ids=[rank], output_device=rank)
+        self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(rank)
+        self.color_network = DDP(self.color_network, device_ids=[rank], output_device=rank)
+        self.renderer = NeuSRenderer(rank, self.nerf_outside,
+                                     self.sdf_network,
+                                     self.deviation_network,
+                                     self.color_network,
+                                     **self.conf['model.neus_renderer'])
+
+
     
     def prepare(self, rank, batch_size=1, pin_memory=False, num_workers=0):
         dataset = NeuSDataset(self.conf['dataset'], self.batch_size, self.end_iter) # batching over rays
@@ -115,19 +130,11 @@ class Runner:
 
 
     def train(self, rank):
-        
+
         # Networks
         self.setup(rank, self.world_size)
         params_to_train = []
-        self.nerf_outside = NeRF(**self.conf['model.nerf']).to(rank)
-        self.nerf_outside = DDP(self.nerf_outside, device_ids=[rank], output_device=rank)
-        self.sdf_network = SDFNetwork(**self.conf['model.sdf_network']).to(rank)
-        self.sdf_network = DDP(self.sdf_network, device_ids=[rank], output_device=rank)
-        self.deviation_network = SingleVarianceNetwork(rank, **self.conf['model.variance_network']).to(rank)
-        self.deviation_network = DDP(self.deviation_network, device_ids=[rank], output_device=rank)
-        self.color_network = RenderingNetwork(**self.conf['model.rendering_network']).to(rank)
-        self.color_network = DDP(self.color_network, device_ids=[rank], output_device=rank)
-
+        
         params_to_train += list(self.nerf_outside.parameters())
         params_to_train += list(self.sdf_network.parameters())
         params_to_train += list(self.deviation_network.parameters())
@@ -135,11 +142,7 @@ class Runner:
 
         self.optimizer = torch.optim.Adam(params_to_train, lr=self.learning_rate)
 
-        self.renderer = NeuSRenderer(rank, self.nerf_outside,
-                                     self.sdf_network,
-                                     self.deviation_network,
-                                     self.color_network,
-                                     **self.conf['model.neus_renderer'])
+        
 
 
         self.writer = SummaryWriter(log_dir=os.path.join(self.base_exp_dir, 'logs'))
@@ -260,15 +263,15 @@ class Runner:
 
         copyfile(self.conf_path, os.path.join(self.base_exp_dir, 'recording', 'config.conf'))
 
-    def load_checkpoint(self, checkpoint_name, rank):
-        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=rank)
-        self.nerf_outside.load_state_dict(convert_ddp_checkpoint(['nerf']))
-        self.sdf_network.load_state_dict(convert_ddp_checkpoint(checkpoint['sdf_network_fine']))
-        self.deviation_network.load_state_dict(convert_ddp_checkpoint(checkpoint['variance_network_fine']))
-        self.color_network.load_state_dict(convert_ddp_checkpoint(checkpoint['color_network_fine']))
-        self.optimizer.load_state_dict(convert_ddp_checkpoint(checkpoint['optimizer']))
+    def load_checkpoint(self, rank, checkpoint_name):
+        checkpoint = torch.load(os.path.join(self.base_exp_dir, 'checkpoints', checkpoint_name), map_location=torch.device(rank))
+        self.nerf_outside.load_state_dict(checkpoint['nerf'])
+        self.sdf_network.load_state_dict(checkpoint['sdf_network_fine'])
+        self.deviation_network.load_state_dict(checkpoint['variance_network_fine'])
+        self.color_network.load_state_dict(checkpoint['color_network_fine'])
+        #self.optimizer.load_state_dict(checkpoint['optimizer'])
         self.iter_step = checkpoint['iter_step']
-
+        self.ckpt_loaded = True
         logging.info('End')
 
     def save_checkpoint(self):
@@ -284,14 +287,28 @@ class Runner:
         os.makedirs(os.path.join(self.base_exp_dir, 'checkpoints'), exist_ok=True)
         torch.save(checkpoint, os.path.join(self.base_exp_dir, 'checkpoints', 'ckpt_{:0>6d}.pth'.format(self.iter_step)))
 
-    def validate_image(self, rank, idx=-1, resolution_level=-1):
+    def validate_image(self, rank, idx=-1, resolution_level=-1, true_rank=None, all_imgs = False, prefix=""):
+        if isinstance(true_rank, int) :
+            print(f"Using GPU {true_rank} to validate image")
+            rank = true_rank
+            self.setup(rank, 1)
+            self.prepare(rank, batch_size=1, pin_memory=False, num_workers=0)
+        if self.is_continue and self.latest_model_name is not None and not self.ckpt_loaded:
+            print('Find checkpoint: {}'.format(self.latest_model_name))
+            self.load_checkpoint(rank, self.latest_model_name)
         if idx < 0:
             idx = np.random.randint(self.dataset.n_images)
+        if all_imgs:
+            for i in range(self.dataset.n_images):
+                self.validate_image(true_rank, idx=i, prefix="val_")
+            return
 
         print('Validate: iter: {}, camera: {}'.format(self.iter_step, idx))
 
         if resolution_level < 0:
             resolution_level = self.validate_resolution_level
+
+
         rays_o, rays_d = self.dataset.gen_rays_at(idx, resolution_level=resolution_level)
         rays_o, rays_d = rays_o.to(rank), rays_d.to(rank)
         H, W, _ = rays_o.shape
@@ -343,13 +360,13 @@ class Runner:
             if len(out_rgb_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'validations_fine',
-                                        '{:0>8d}_{}_{}_rank{}.png'.format(self.iter_step, i, idx, rank)),
+                                        prefix + '{:0>8d}_{}_{}_rank{}.png'.format(self.iter_step, i, idx, rank)),
                            np.concatenate([img_fine[..., i],
                                            self.dataset.image_at(idx, resolution_level=resolution_level)]))
             if len(out_normal_fine) > 0:
                 cv.imwrite(os.path.join(self.base_exp_dir,
                                         'normals',
-                                        '{:0>8d}_{}_{}_rank{}.png'.format(self.iter_step, i, idx, rank)),
+                                        prefix + '{:0>8d}_{}_{}_rank{}.png'.format(self.iter_step, i, idx, rank)),
                            normal_img[..., i])
 
     def render_novel_image(self, idx_0, idx_1, ratio, resolution_level):
@@ -380,10 +397,15 @@ class Runner:
         img_fine = (np.concatenate(out_rgb_fine, axis=0).reshape([H, W, 3]) * 256).clip(0, 255).astype(np.uint8)
         return img_fine
 
-    def validate_mesh(self, rank, world_space=False, resolution=512, threshold=0.0):
-        if self.is_continue and self.latest_model_name is not None:
+    def validate_mesh(self, rank, world_space=False, resolution=512, threshold=0.0, true_rank=None):
+        if isinstance(true_rank, int) :
+            print(f"Using GPU {true_rank} to validate mesh")
+            rank = true_rank
+            self.setup(rank, 1)
+            self.prepare(rank, batch_size=1, pin_memory=False, num_workers=0)
+        if self.is_continue and self.latest_model_name is not None and not self.ckpt_loaded:
             logging.info('Find checkpoint: {}'.format(self.latest_model_name))
-            self.load_checkpoint(self.latest_model_name)
+            self.load_checkpoint(rank, self.latest_model_name)
 
         bound_min = torch.tensor(self.dataset.object_bbox_min, dtype=torch.float32).to(rank)
         bound_max = torch.tensor(self.dataset.object_bbox_max, dtype=torch.float32).to(rank)
@@ -429,7 +451,7 @@ class Runner:
 if __name__ == '__main__':
     print('Hello Wooden')
     # suppose we have 3 gpus
-    world_size = 3    
+    world_size = 3
     
     #torch.set_default_tensor_type('torch.cuda.FloatTensor')
 
@@ -441,13 +463,13 @@ if __name__ == '__main__':
     parser.add_argument('--mode', type=str, default='train')
     parser.add_argument('--mcube_threshold', type=float, default=0.0)
     parser.add_argument('--is_continue', default=False, action="store_true")
-    parser.add_argument('--gpu', type=int, default=0)
+    parser.add_argument('--gpu', type=int, default=None)
     parser.add_argument('--case', type=str, default='')
 
     args = parser.parse_args()
 
     #torch.cuda.set_device(args.gpu)
-    runner = Runner(args.conf, args.mode, args.case, args.is_continue)
+    runner = Runner(args.conf, args.mode, args.case, args.is_continue, world_size)
 
     if args.mode == 'train':
         torch.multiprocessing.spawn(
@@ -455,11 +477,23 @@ if __name__ == '__main__':
         nprocs=world_size
     )
     elif args.mode == 'validate_mesh':
+        if args.gpu is None:
+            print("Specify GPU using --gpu ")
+            exit()
         torch.multiprocessing.spawn(
         runner.validate_mesh,
+        args=(True, 512, 0.0, args.gpu),
         nprocs=1
-    )
-        runner.validate_mesh(world_space=True, resolution=1024, threshold=args.mcube_threshold)
+        )
+    elif args.mode == 'validate_image':
+        if args.gpu is None:
+            print("Specify GPU using --gpu ")
+            exit()
+        torch.multiprocessing.spawn(
+        runner.validate_image,
+        args=(-1, -1, args.gpu, True),
+        nprocs=1
+        )
     elif args.mode.startswith('interpolate'):  # Interpolate views given two image indices
         _, img_idx_0, img_idx_1 = args.mode.split('_')
         img_idx_0 = int(img_idx_0)
