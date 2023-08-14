@@ -465,6 +465,7 @@ if __name__ == '__main__':
     parser.add_argument('--is_continue', default=False, action="store_true")
     parser.add_argument('--gpu', type=int, default=None)
     parser.add_argument('--case', type=str, default='')
+    parser.add_argument('--resolution', type=int, default=1024)
 
     args = parser.parse_args()
 
@@ -482,7 +483,7 @@ if __name__ == '__main__':
             exit()
         torch.multiprocessing.spawn(
         runner.validate_mesh,
-        args=(True, 512, 0.0, args.gpu),
+        args=(True, args.resolution, 0.0, args.gpu),
         nprocs=1
         )
     elif args.mode == 'validate_image':
